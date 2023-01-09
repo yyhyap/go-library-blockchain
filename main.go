@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/gorilla/mux"
@@ -39,6 +40,7 @@ type Book struct {
 var (
 	NewBlockChain           *Blockchain = NewBlockchain()
 	isGenesisBlockGenerated             = false
+	mutex                               = &sync.RWMutex{}
 )
 
 func NewBlockchain() *Blockchain {
@@ -105,18 +107,25 @@ func (blockchain *Blockchain) AddBlock(book Book) {
 		log.Println("Block to be added: ", block)
 
 		if ValidBlock(block, prevBlock) {
+			mutex.Lock()
 			blockchain.blocks = append(blockchain.blocks, block)
+			mutex.Unlock()
 		}
 	} else {
 		block := CreateBlock(&Block{Index: -1}, book)
 		log.Println("Block to be added: ", block)
+		mutex.Lock()
 		blockchain.blocks = append(blockchain.blocks, block)
 		isGenesisBlockGenerated = true
+		mutex.Unlock()
 	}
 }
 
 func GetBlockchain(w http.ResponseWriter, r *http.Request) {
-	resp, err := json.MarshalIndent(NewBlockChain.blocks, "", " ")
+	mutex.RLock()
+	blocks := NewBlockChain.blocks
+	mutex.RUnlock()
+	resp, err := json.MarshalIndent(blocks, "", " ")
 
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
