@@ -5,10 +5,12 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -20,11 +22,13 @@ type Blockchain struct {
 }
 
 type Block struct {
-	Index     int
-	Data      Book
-	Timestamp string
-	Hash      string
-	PrevHash  string
+	Index      int
+	Data       *Book
+	Timestamp  string
+	Hash       string
+	PrevHash   string
+	Nonce      string
+	Difficulty int
 }
 
 type Book struct {
@@ -38,16 +42,18 @@ type Book struct {
 }
 
 var (
-	NewBlockChain           *Blockchain = NewBlockchain()
-	isGenesisBlockGenerated             = false
-	mutex                               = &sync.RWMutex{}
+	NewBlockChain     *Blockchain = NewBlockchain()
+	difficulty                    = 1
+	difficultyCounter             = 0
+	mutex                         = &sync.RWMutex{}
+	difficultyMutex               = &sync.RWMutex{}
 )
 
 func NewBlockchain() *Blockchain {
 	return &Blockchain{[]*Block{}}
 }
 
-func (block *Block) ValidateHash(hash string) bool {
+func (block *Block) ValidateBlockHash(hash string) bool {
 	block.GenerateHash()
 	return block.Hash == hash
 }
@@ -61,7 +67,7 @@ func (block *Block) GenerateHash() {
 	}
 
 	// concatenate all of the data from the block
-	data := strconv.Itoa(block.Index) + block.Timestamp + string(bytes) + block.PrevHash
+	data := strconv.Itoa(block.Index) + block.PrevHash + block.Timestamp + string(bytes) + block.Nonce + strconv.Itoa(block.Difficulty)
 
 	// hash the data using sha256
 	hash := sha256.New()
@@ -69,7 +75,7 @@ func (block *Block) GenerateHash() {
 	block.Hash = hex.EncodeToString(hash.Sum(nil))
 }
 
-func CreateBlock(prevBlock *Block, book Book) *Block {
+func CreateBlock(prevBlock *Block, book *Book) *Block {
 	// empty block
 	block := &Block{}
 
@@ -78,12 +84,31 @@ func CreateBlock(prevBlock *Block, book Book) *Block {
 	block.PrevHash = prevBlock.Hash
 	block.Timestamp = time.Now().String()
 	block.Data = book
-	block.GenerateHash()
+
+	difficultyMutex.RLock()
+	block.Difficulty = difficulty
+	difficultyMutex.RUnlock()
+
+	for i := 0; ; i++ {
+		hex := fmt.Sprintf("%x", i)
+		block.Nonce = hex
+		block.GenerateHash()
+		if IsNewBlockHashValid(block.Hash, block.Difficulty) {
+			break
+		}
+	}
 
 	return block
 }
 
-func ValidBlock(block, prevBlock *Block) bool {
+func IsNewBlockHashValid(hash string, blockDifficulty int) bool {
+	prefix := strings.Repeat("0", blockDifficulty)
+	return strings.HasPrefix(hash, prefix)
+}
+
+func (blockchain *Blockchain) IsValidNewBlock(block *Block) bool {
+	prevBlock := blockchain.blocks[len(blockchain.blocks)-1]
+
 	if prevBlock.Hash != block.PrevHash {
 		return false
 	}
@@ -92,40 +117,44 @@ func ValidBlock(block, prevBlock *Block) bool {
 		return false
 	}
 
-	if !(block.ValidateHash(block.Hash)) {
+	if !(block.ValidateBlockHash(block.Hash)) {
 		return false
 	}
 
 	return true
 }
 
-func (blockchain *Blockchain) AddBlock(book Book) {
-	if isGenesisBlockGenerated {
-		prevBlock := blockchain.blocks[len(blockchain.blocks)-1]
+func (blockchain *Blockchain) AddBlock(book *Book) error {
+	mutex.RLock()
+	prevBlock := blockchain.blocks[len(blockchain.blocks)-1]
+	mutex.RUnlock()
 
-		block := CreateBlock(prevBlock, book)
-		log.Println("Block to be added: ", block)
+	block := CreateBlock(prevBlock, book)
 
-		if ValidBlock(block, prevBlock) {
-			mutex.Lock()
-			blockchain.blocks = append(blockchain.blocks, block)
-			mutex.Unlock()
-		}
-	} else {
-		block := CreateBlock(&Block{Index: -1}, book)
-		log.Println("Block to be added: ", block)
-		mutex.Lock()
+	mutex.Lock()
+	defer mutex.Unlock()
+	if blockchain.IsValidNewBlock(block) {
 		blockchain.blocks = append(blockchain.blocks, block)
-		isGenesisBlockGenerated = true
-		mutex.Unlock()
+		SetDifficulty()
+		return nil
+	} else {
+		return fmt.Errorf("new block: %v is not valid, previous block: %v", block, blockchain.blocks[len(blockchain.blocks)-1])
+	}
+}
+
+func SetDifficulty() {
+	difficultyMutex.Lock()
+	defer difficultyMutex.Unlock()
+	if difficultyCounter == 9 {
+		difficulty++
+		difficultyCounter = 0
+	} else {
+		difficultyCounter++
 	}
 }
 
 func GetBlockchain(w http.ResponseWriter, r *http.Request) {
-	mutex.RLock()
-	blocks := NewBlockChain.blocks
-	mutex.RUnlock()
-	resp, err := json.MarshalIndent(blocks, "", " ")
+	resp, err := json.MarshalIndent(NewBlockChain.blocks, "", " ")
 
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
@@ -150,13 +179,17 @@ func NewBook(w http.ResponseWriter, r *http.Request) {
 
 	book.ID = GenerateMD5Hash(book.ISBN + book.PublishDate)
 
-	NewBlockChain.AddBlock(book)
+	err := NewBlockChain.AddBlock(&book)
 
-	returnDto := map[string]interface{}{
-		"message": "book has been added to the library blockchain",
+	returnDto := map[string]interface{}{}
+
+	if err != nil {
+		log.Printf("error while adding block: %v", err.Error())
+		returnDto["error"] = err.Error()
+	} else {
+		returnDto["message"] = "book has been added to the library blockchain"
 	}
 
-	// https://stackoverflow.com/questions/44495489/what-is-the-difference-between-json-marshal-and-json-marshalindent-using-go
 	res, err := json.Marshal(returnDto)
 
 	if err != nil {
@@ -182,6 +215,19 @@ func init() {
 }
 
 func main() {
+	genesisBlock := &Block{
+		Index:     -1,
+		Data:      nil,
+		Timestamp: time.Now().String(),
+		PrevHash:  "",
+		Nonce:     "",
+	}
+	genesisBlock.GenerateHash()
+
+	mutex.Lock()
+	NewBlockChain.blocks = append(NewBlockChain.blocks, genesisBlock)
+	mutex.Unlock()
+
 	r := mux.NewRouter()
 	r.HandleFunc("/", GetBlockchain).Methods("GET")
 	r.HandleFunc("/new", NewBook).Methods("POST")
